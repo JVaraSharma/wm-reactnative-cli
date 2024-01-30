@@ -184,7 +184,14 @@ const args = require('yargs')
                 runExpo(args.previewUrl, args.web, args.clean)
         }).command('web-preview <previewUrl>',
             'launches React Native app in web browser.',
-            yargs => {},
+            yargs => {
+                yargs.option('proxyHost', {
+                    describe: 'If provided, this will be used as the host name to the proxy server. By default, ip address is used as host name.'
+                }).option('basePath', {
+                    describe: 'Base Path at which the web preview has to be server.',
+                    default: '/rn-bundle/',
+                })
+            },
             (args) => {
                 if (args.clean) {
                     localStorage.clear();
@@ -195,7 +202,7 @@ const args = require('yargs')
                 if (args.esbuild) {
                     runESBuildWebPreview(args.previewUrl, args.clean, authToken);
                 } else {
-                    runWeb(args.previewUrl, args.clean, authToken);
+                    runWeb(args.previewUrl, args.clean, authToken, args.proxyHost, args.basePath);
                 }
         }).command('android <previewUrl>',
             'launches React Native app in a Android device.',
@@ -230,6 +237,10 @@ const args = require('yargs')
         yargs.positional('previewUrl', {
             describe: 'Pereview Url of the React Native app.',
             type: 'string'
+        }).option('useProxy', {
+            describe: 'If set to true then all preview requests are routed through a internal proxy server.',
+            default: false,
+            type: 'boolean'
         }).option('clean', {
             describe: 'If set to true then all existing folders are removed.',
             default: false,
@@ -239,7 +250,7 @@ const args = require('yargs')
         if (args.clean) {
             localStorage.clear();
         }
-        sync(args.previewUrl, args.clean);
+        sync(args.previewUrl, args.clean, args.useProxy);
     })
     .help('h')
     .alias('h', 'help').argv;

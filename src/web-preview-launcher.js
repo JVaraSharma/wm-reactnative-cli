@@ -15,23 +15,33 @@ const axios = require('axios');
 const { setupProject } = require('./project-sync.service');
 let webPreviewPort = 19006;
 const proxyPort = 19009;
-const proxyUrl = `http://localhost:${proxyPort}`;
+let proxyUrl = `http://localhost:${proxyPort}`;
 const loggerLabel = 'expo-launcher';
 let codegen = '';
-
+let basePath = '/rn-bundle/';
 function launchServiceProxy(projectDir, previewUrl) {
     const proxy =  httpProxy.createProxyServer({});
     const wmProjectDir = getWmProjectDir(projectDir);
     http.createServer(function (req, res) {
         try {
-            let tUrl = req.url;
-            if (req.url === '/' || (!req.url.startsWith('/_/'))) {
-                tUrl = `http://localhost:${webPreviewPort}${req.url}`;
-                req.pipe(request(tUrl, function(error, res, body){
-                    //error && console.log(error);
-                })).pipe(res);
-            } else {
-                req.url = req.url.substring(2);
+            let tUrl = `http://localhost:${webPreviewPort}/${req.url}`;
+            if (req.url.endsWith('index.html')) {
+                axios.get(tUrl.replace(basePath, '')).then(body => {
+                    res.end(body.data
+                        .replace('/index.bundle', `./index.bundle`));
+                });
+                return;
+            }
+            if (req.url.startsWith(basePath)) {
+                tUrl = tUrl.replace(basePath, '');
+            }
+            if (req.url === '/') {
+                res.writeHead(302, {'Location': `${basePath}index.html`});
+                res.end();
+            } else if (req.url.startsWith(basePath + '_/_')
+                || req.url.startsWith(basePath + '_')) {
+                req.url = req.url.replace(basePath + '_/_', '')
+                            .replace(basePath + '_', '');
                 proxy.web(req, res, {
                     target: previewUrl,
                     secure: false,
@@ -41,7 +51,12 @@ function launchServiceProxy(projectDir, previewUrl) {
                         "*": ""
                     }
                 });
-            }
+            } else {
+                req.headers.origin = `http://localhost:${webPreviewPort}`;
+                req.pipe(request(tUrl, function(error, res, body){
+                    //error && console.log(error);
+                })).pipe(res);
+            } 
         } catch(e) {
             res.writeHead(500);
             console.error(e);
@@ -69,15 +84,20 @@ function launchServiceProxy(projectDir, previewUrl) {
     });
 }
 
-async function transpile(projectDir, previewUrl) {
+async function transpile(projectDir, previewUrl, incremental) {
     codegen || await getCodeGenPath(projectDir);
     const wmProjectDir = getWmProjectDir(projectDir);
     const configJSONFile = `${wmProjectDir}/wm_rn_config.json`;
     const config = fs.readJSONSync(configJSONFile);
-    config.serverPath = `${proxyUrl}/_`;
+    config.serverPath = `./_`;
     fs.writeFileSync(configJSONFile, JSON.stringify(config, null, 4));
+    let profile = 'expo-preview';
+    if(fs.existsSync(`${codegen}/src/profiles/expo-web-preview.profile.js`)){
+        profile = 'expo-web-preview';
+    }
     await exec('node',
-        [codegen + '/index.js', 'transpile', '--profile="expo-preview"', '--autoClean=false',
+        [codegen + '/index.js', 'transpile', `--profile="${profile}"`, '--autoClean=false',
+        `--incrementalBuild=${!!incremental}`,
             getWmProjectDir(projectDir), getExpoProjectDir(projectDir)]);
     // TODO: iOS app showing blank screen
     if (!(config.sslPinning && config.sslPinning.enabled)) {
@@ -101,9 +121,10 @@ async function updateForWebPreview(projectDir) {
     }));
     if (package['dependencies']['expo'] === '48.0.18') {
         webPreviewPort = 19000;
-        package.devDependencies['esbuild'] = '^0.15.15';
         package.devDependencies['fs-extra'] = '^10.0.0';
         package.devDependencies['@babel/plugin-proposal-export-namespace-from'] = '7.18.9';
+        delete package.devDependencies['esbuild'];
+        delete package.devDependencies['esbuild-plugin-resolve'];
         fs.copySync(`${codegen}/src/templates/project/esbuild`, `${getExpoProjectDir(projectDir)}/esbuild`);
         await readAndReplaceFileContent(`${getExpoProjectDir(projectDir)}/babel.config.js`, content => {
             if (content.indexOf('@babel/plugin-proposal-export-namespace-from') < 0) {
@@ -122,16 +143,21 @@ async function updateForWebPreview(projectDir) {
             return JSON.stringify(appJson, null, 4);
         });
     } else {
+        webPreviewPort = 8081;
         package.dependencies['react-native-svg'] = '13.4.0';
         package.dependencies['react-native-reanimated'] = '^1.13.2';
         package.dependencies['victory'] = '^36.5.3';
-        package.devDependencies['esbuild'] = '^0.15.15';
         package.devDependencies['fs-extra'] = '^10.0.0';
+        delete package.devDependencies['esbuild'];
+        delete package.devDependencies['esbuild-plugin-resolve'];
         fs.copySync(`${codegen}/src/templates/project/esbuild`, `${getExpoProjectDir(projectDir)}/esbuild`);
         readAndReplaceFileContent(`${getExpoProjectDir(projectDir)}/babel.config.js`, content => 
             content.replace(`'react-native-reanimated/plugin',`, ''));
     }
     fs.writeFileSync(packageFile, JSON.stringify(package, null, 4));
+    await readAndReplaceFileContent(`${getExpoProjectDir(projectDir)}/esbuild/esbuild.script.js`, (content)=>{
+        return content.replace('const esbuild', '//const esbuild').replace('const resolve', '//const resolve');
+    });
 }
 
 async function getCodeGenPath(projectDir) {
@@ -178,9 +204,23 @@ async function installDependencies(projectDir) {
         overwrite: true
         });
     const nodeModulesDir = `${expoDir}/node_modules/@wavemaker/app-rn-runtime`;
+    // To remove openBrowser()
+    readAndReplaceFileContent(`${expoDir}/node_modules/open/index.js`, (c) => c.replace("const subprocess", 'return;\n\nconst subprocess'));
+    readAndReplaceFileContent(`${expoDir}/node_modules/@expo/cli/build/src/utils/open.js`, (c) => c.replace('if (process.platform !== "win32")', 'return;\n\n if (process.platform !== "win32")'));
     readAndReplaceFileContent(`${nodeModulesDir}/core/base.component.js`, (c) => c.replace(/\?\?/g, '||'));
     readAndReplaceFileContent(`${nodeModulesDir}/components/advanced/carousel/carousel.component.js`, (c) => c.replace(/\?\?/g, '||'));
     readAndReplaceFileContent(`${nodeModulesDir}/components/input/rating/rating.component.js`, (c) => c.replace(/\?\?/g, '||'));
+    readAndReplaceFileContent(`${expoDir}/node_modules/expo-camera/build/useWebQRScanner.js`, (c) => {
+        if (c.indexOf('@koale/useworker') > 0) {
+            return fs.readFileSync(`${__dirname}/../templates/expo-camera-patch/useWebQRScanner.js`, {
+                encoding: 'utf-8'
+            })
+        }
+        return c;
+    });
+    await readAndReplaceFileContent(`${expoDir}/node_modules/expo-font/build/ExpoFontLoader.web.js`, (content)=>{
+        return content.replace('src: url(${resource.uri});', 'src: url(.${resource.uri});');
+    });
 }
 
 function clean(path) {
@@ -213,7 +253,7 @@ async function setup(previewUrl, _clean, authToken) {
         fs.mkdirpSync(getWmProjectDir(projectDir));
     }
     const syncProject = await setupProject(previewUrl, projectName, projectDir, authToken);
-    await transpile(projectDir, previewUrl);
+    await transpile(projectDir, previewUrl, false);
     return {projectDir, syncProject};
 }
 
@@ -252,6 +292,10 @@ function watchForPlatformChanges(callBack) {
             fs.unlinkSync(`${codegen}/wavemaker-rn-codegen/dist/new-build`);
             doBuild = true;
         }
+        if (fs.existsSync(`${codegen}/wavemaker-ui-variables/dist/new-build`)) {
+            fs.unlinkSync(`${codegen}/wavemaker-ui-variables/dist/new-build`);
+            doBuild = true;
+        }
         if (doBuild && callBack) {
             console.log('\n\n\n')
             logger.info({
@@ -281,7 +325,7 @@ async function runWeb(previewUrl, clean, authToken) {
                 });
             })
             .then(() => {
-                return transpile(projectDir, previewUrl).then(() => {
+                return transpile(projectDir, previewUrl, true).then(() => {
                     if (!isExpoStarted) {
                         isExpoStarted = true;
                         launchServiceProxy(projectDir, previewUrl);
@@ -298,7 +342,7 @@ async function runWeb(previewUrl, clean, authToken) {
                 });
             });
         });
-        watchForPlatformChanges(() => transpile(projectDir, previewUrl));
+        watchForPlatformChanges(() => transpile(projectDir, previewUrl, false));
     } catch(e) {
         logger.error({
             label: loggerLabel,
@@ -308,5 +352,10 @@ async function runWeb(previewUrl, clean, authToken) {
 }
 
 module.exports = {
-    runWeb: runWeb
+    runWeb: (previewUrl, clean, authToken, proxyHost, _basePath) => {
+        proxyHost = proxyHost || 'localhost';
+        proxyUrl = `http://${proxyHost}:${proxyPort}`;
+        basePath = _basePath;
+        return runWeb(previewUrl, clean, authToken);
+    }
 };

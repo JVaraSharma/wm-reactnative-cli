@@ -25,6 +25,7 @@ function installGlobalNpmPackage(package) {
 }
 
 var isWebPreview = false;
+var useProxy = false;
 
 function launchServiceProxy(projectDir, previewUrl) {
     const proxy =  httpProxy.createProxyServer({});
@@ -53,6 +54,7 @@ function launchServiceProxy(projectDir, previewUrl) {
                     target: previewUrl,
                     xfwd: false,
                     changeOrigin: true,
+                    secure: false,
                     cookiePathRewrite: {
                         "*": ""
                     }
@@ -138,7 +140,7 @@ async function updatePackageJsonFile(path) {
     });
 }
 
-async function transpile(projectDir, previewUrl) {
+async function transpile(projectDir, previewUrl, incremental) {
     let codegen = process.env.WAVEMAKER_STUDIO_FRONTEND_CODEBASE;
     if (codegen) {
         codegen = `${codegen}/wavemaker-rn-codegen/build/index.js`;
@@ -158,20 +160,26 @@ async function transpile(projectDir, previewUrl) {
             await exec('npm', ['install', '--save-dev', `@wavemaker/rn-codegen@${uiVersion}`], {
                 cwd: temp
             });
-        }
+        }     
+        await readAndReplaceFileContent(`${codegen}/src/profiles/expo-preview.profile.js`, (content) => {
+            return content.replace('copyResources: false', 'copyResources: true');
+        });
     }
     const wmProjectDir = getWmProjectDir(projectDir);
     const configJSONFile = `${wmProjectDir}/wm_rn_config.json`;
     const config = fs.readJSONSync(configJSONFile);
     if (isWebPreview) {
         config.serverPath = `${proxyUrl}/_`;
-    } else {
+    } else if (useProxy) {
         config.serverPath = `http://${getIpAddress()}:19009/`;
+    } else {
+        config.serverPath = previewUrl;
     }
     fs.writeFileSync(configJSONFile, JSON.stringify(config, null, 4));
     const profile = isWebPreview ? 'web-preview' : 'expo-preview';
     await exec('node',
         [codegen, 'transpile', '--profile="' + profile + '"', '--autoClean=false',
+            `--incrementalBuild=${!!incremental}`,
             getWmProjectDir(projectDir), getExpoProjectDir(projectDir)]);
     // TODO: iOS app showing blank screen
     if (!(config.sslPinning && config.sslPinning.enabled)) {
@@ -239,7 +247,7 @@ async function setup(previewUrl, _clean, authToken) {
         fs.mkdirpSync(getWmProjectDir(projectDir));
     }
     const syncProject = await setupProject(previewUrl, projectName, projectDir, authToken);
-    await transpile(projectDir, previewUrl);
+    await transpile(projectDir, previewUrl, false);
     return {projectDir, syncProject};
 }
 
@@ -287,6 +295,10 @@ function watchForPlatformChanges(callBack) {
             fs.unlinkSync(`${codegen}/wavemaker-rn-codegen/dist/new-build`);
             doBuild = true;
         }
+        if (fs.existsSync(`${codegen}/wavemaker-ui-variables/dist/new-build`)) {
+            fs.unlinkSync(`${codegen}/wavemaker-ui-variables/dist/new-build`);
+            doBuild = true;
+        }
         if (doBuild && callBack) {
             console.log('\n\n\n')
             logger.info({
@@ -315,7 +327,9 @@ async function runExpo(previewUrl, clean, authToken) {
             encoding: 'utf-8'
         }));
         barcodePort = package['dependencies']['expo'] === '48.0.18' ? 19000:8081;
-        launchServiceProxy(projectDir, previewUrl);
+        if (useProxy || isWebPreview) {
+            launchServiceProxy(projectDir, previewUrl);
+        }
         if (!isWebPreview) {
             launchExpo(projectDir);
         }
@@ -328,7 +342,7 @@ async function runExpo(previewUrl, clean, authToken) {
                     message: `Sync Time: ${(Date.now() - startTime)/ 1000}s.`
                 });
             })
-            .then(() => transpile(projectDir, previewUrl))
+            .then(() => transpile(projectDir, previewUrl, true))
             .then(() => {
                 logger.info({
                     label: loggerLabel,
@@ -336,7 +350,7 @@ async function runExpo(previewUrl, clean, authToken) {
                 });
             });
         });
-        watchForPlatformChanges(() => transpile(projectDir, previewUrl));
+        watchForPlatformChanges(() => transpile(projectDir, previewUrl, false));
     } catch(e) {
         logger.error({
             label: loggerLabel,
@@ -348,7 +362,9 @@ async function runExpo(previewUrl, clean, authToken) {
 async function sync(previewUrl, clean) {
     const {projectDir, syncProject} = await setup(previewUrl, clean);
     await installDependencies(projectDir);
-    launchServiceProxy(projectDir, previewUrl);
+    if (useProxy) {
+        launchServiceProxy(projectDir, previewUrl);
+    }
     watchProjectChanges(previewUrl, () => {
         const startTime = Date.now();
         syncProject()
@@ -357,7 +373,7 @@ async function sync(previewUrl, clean) {
                 label: loggerLabel,
                 message: `Sync Time: ${(Date.now() - startTime)/ 1000}s.`
             });
-        }).then(() => transpile(projectDir, previewUrl))
+        }).then(() => transpile(projectDir, previewUrl, true))
         .then(() => {
             logger.info({
                 label: loggerLabel,
@@ -365,7 +381,7 @@ async function sync(previewUrl, clean) {
             });
         });
     });
-    watchForPlatformChanges(() => transpile(projectDir, previewUrl));
+    watchForPlatformChanges(() => transpile(projectDir, previewUrl, false));
 }
 
 async function runNative(previewUrl, platform, clean) {
@@ -374,11 +390,13 @@ async function runNative(previewUrl, platform, clean) {
 
         await installDependencies(projectDir);
         updateReanimatedPlugin(projectDir);
-        launchServiceProxy(projectDir, previewUrl);
+        if (useProxy) {
+            launchServiceProxy(projectDir, previewUrl);
+        }
         await exec('npx', ['expo','prebuild'], {
             cwd: getExpoProjectDir(projectDir)
         });
-        await transpile(projectDir, previewUrl);
+        await transpile(projectDir, previewUrl, false);
         await installDependencies(projectDir);
         if (platform === 'ios') {
             await exec('pod', ['install'], {
@@ -400,7 +418,7 @@ async function runNative(previewUrl, platform, clean) {
                         message: `Sync Time: ${(Date.now() - startTime)/ 1000}s.`
                     });
                 })
-                .then(() => transpile(projectDir, previewUrl))
+                .then(() => transpile(projectDir, previewUrl, true))
                 .then(() => {
                     logger.info({
                         label: loggerLabel,
@@ -408,7 +426,7 @@ async function runNative(previewUrl, platform, clean) {
                     });
                 });
         });
-        watchForPlatformChanges(() => transpile(projectDir, previewUrl));
+        watchForPlatformChanges(() => transpile(projectDir, previewUrl, false));
     } catch(e) {
         logger.error({
             label: loggerLabel,
@@ -425,5 +443,8 @@ module.exports = {
     runExpo: runExpo,
     runAndroid: (previewUrl, clean) => runNative(previewUrl, 'android', clean),
     runIos: (previewUrl, clean) => runNative(previewUrl, 'ios', clean),
-    sync: (previewUrl, clean) => sync(previewUrl, clean)
+    sync: (previewUrl, clean, _useProxy) => {
+        useProxy = _useProxy;
+        return sync(previewUrl, clean)
+    }
 };
